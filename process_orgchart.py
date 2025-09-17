@@ -236,17 +236,23 @@ class FYCBasedRule(PromotionRule):
         return not self.rank_filter or current_rank in self.rank_filter
     
     def evaluate(self, current_rank: str, performance_data: Dict) -> str:
-        """Evaluate based on FYC thresholds."""
+        """Evaluate based on FYC thresholds (conservative demotion logic)."""
         fyc_total = performance_data.get('承保FYC', 0)
         if pd.isna(fyc_total):
             fyc_total = 0
-            
+        
+        # Only allow demotions during assessment months and for severe underperformance
+        is_assessment_month = performance_data.get('is_assessment_month', False)
+        
         if fyc_total >= self.promotion_threshold:
             return '晋升'
         elif fyc_total >= self.maintain_threshold:
             return '维持'
-        else:
+        elif is_assessment_month and fyc_total < (self.maintain_threshold * 0.5):
+            # Only demote if performance is less than 50% of maintain threshold during assessment
             return '降级'
+        else:
+            return '维持'  # Conservative: maintain instead of demote
 
 class CompositeRule(PromotionRule):
     """Rule that combines multiple performance metrics."""
@@ -265,10 +271,11 @@ class CompositeRule(PromotionRule):
         return not self.rank_filter or current_rank in self.rank_filter
     
     def evaluate(self, current_rank: str, performance_data: Dict) -> str:
-        """Evaluate based on multiple criteria."""
+        """Evaluate based on multiple criteria (conservative demotion logic)."""
         fyc = performance_data.get('承保FYC', 0) or 0
         renewal_rate = performance_data.get('续保率', 0) or 0
         new_policies = performance_data.get('新单件数', 0) or 0
+        is_assessment_month = performance_data.get('is_assessment_month', False)
         
         # Count how many criteria are met
         criteria_met = 0
@@ -281,13 +288,16 @@ class CompositeRule(PromotionRule):
         if new_policies >= self.new_policies_threshold:
             criteria_met += 1
         
-        # Decision based on criteria met
+        # Decision based on criteria met (more conservative)
         if criteria_met >= 3:
             return '晋升'
-        elif criteria_met >= 2:
+        elif criteria_met >= 1:  # More lenient: maintain if any criteria met
             return '维持'
-        else:
+        elif is_assessment_month and criteria_met == 0:
+            # Only demote if NO criteria are met during assessment months
             return '降级'
+        else:
+            return '维持'  # Default to maintain
 
 class ExcelBasedRule(PromotionRule):
     """Rule that reads criteria from Excel sheets."""
@@ -574,16 +584,16 @@ class GradeSpecificRule(PromotionRule):
             }
         }
         
-        # Define maintenance/demotion thresholds (lower than promotion)
+        # Define maintenance/demotion thresholds (much lower than promotion, only for severe underperformance)
         self.maintenance_requirements = {
-            'AS': {'individual_fyc': 9000, 'direct_fyc': 15000, 'renewal_rate': 0.85, 'team_size': 3},
-            'BM0': {'individual_fyc': 12000, 'direct_fyc': 25200, 'renewal_rate': 0.85, 'team_size': 2},
-            'BM1': {'individual_fyc': 12000, 'direct_fyc': 63000, 'renewal_rate': 0.85, 'team_size': 4},
-            'BM2': {'individual_fyc': 12000, 'direct_fyc': 105000, 'renewal_rate': 0.85, 'team_size': 8},
-            'BM3': {'individual_fyc': 12000, 'direct_fyc': 175000, 'renewal_rate': 0.85, 'team_size': 14},
-            'AD0': {'individual_fyc': 12000, 'direct_fyc': 112500, 'group_fyc': 300000, 'renewal_rate': 0.85, 'team_size': 21},
-            'AD1': {'individual_fyc': 12000, 'direct_fyc': 135000, 'group_fyc': 450000, 'renewal_rate': 0.85, 'team_size': 38},
-            'AD2': {'group_fyc': 2000000, 'team_size': 80}
+            'AS': {'individual_fyc': 5000, 'direct_fyc': 8000, 'renewal_rate': 0.70},  # Much lower thresholds
+            'BM0': {'individual_fyc': 6000, 'direct_fyc': 12000, 'renewal_rate': 0.70},
+            'BM1': {'individual_fyc': 8000, 'direct_fyc': 30000, 'renewal_rate': 0.70},
+            'BM2': {'individual_fyc': 8000, 'direct_fyc': 50000, 'renewal_rate': 0.70},
+            'BM3': {'individual_fyc': 8000, 'direct_fyc': 80000, 'renewal_rate': 0.70},
+            'AD0': {'individual_fyc': 8000, 'direct_fyc': 60000, 'group_fyc': 150000, 'renewal_rate': 0.70},
+            'AD1': {'individual_fyc': 8000, 'direct_fyc': 70000, 'group_fyc': 200000, 'renewal_rate': 0.70},
+            'AD2': {'group_fyc': 800000}  # Much lower threshold for demotion
         }
     
     def applies_to(self, current_rank: str, performance_data: Dict) -> bool:
@@ -592,6 +602,9 @@ class GradeSpecificRule(PromotionRule):
     
     def evaluate(self, current_rank: str, performance_data: Dict) -> str:
         """Evaluate based on grade-specific requirements with GT/DT relationship validation."""
+        # Only allow demotions during assessment months (conservative approach)
+        is_assessment_month = performance_data.get('is_assessment_month', False)
+        
         # Check promotion first
         if current_rank in self.promotion_requirements:
             req = self.promotion_requirements[current_rank]
@@ -675,28 +688,42 @@ class GradeSpecificRule(PromotionRule):
             renewal_rate = performance_data.get('续保率', 0) or 0
             team_size = performance_data.get('直辖人力', 0) or performance_data.get('所辖人力', 0) or 0
             
-            # Check if maintenance criteria are met
-            maintenance_met = True
+            # Check if maintenance criteria are met (more lenient - only demote for severe underperformance)
+            critical_failures = 0
+            total_criteria = 0
             
-            if maint_req.get('individual_fyc', 0) > 0 and individual_fyc < maint_req['individual_fyc']:
-                maintenance_met = False
+            # Check individual FYC (most important)
+            if maint_req.get('individual_fyc', 0) > 0:
+                total_criteria += 1
+                if individual_fyc < maint_req['individual_fyc']:
+                    critical_failures += 2  # Weight individual performance heavily
             
-            if maint_req.get('direct_fyc', 0) > 0 and direct_fyc < maint_req['direct_fyc']:
-                maintenance_met = False
+            # Check direct team FYC
+            if maint_req.get('direct_fyc', 0) > 0:
+                total_criteria += 1
+                if direct_fyc < maint_req['direct_fyc']:
+                    critical_failures += 1
             
-            if maint_req.get('group_fyc', 0) > 0 and group_fyc < maint_req['group_fyc']:
-                maintenance_met = False
-                
-            if maint_req.get('renewal_rate', 0) > 0 and renewal_rate < maint_req['renewal_rate']:
-                maintenance_met = False
-                
-            if maint_req.get('team_size', 0) > 0 and team_size < maint_req['team_size']:
-                maintenance_met = False
+            # Check group FYC (for senior roles)
+            if maint_req.get('group_fyc', 0) > 0:
+                total_criteria += 1
+                if group_fyc < maint_req['group_fyc']:
+                    critical_failures += 1
+                    
+            # Check renewal rate (quality indicator)
+            if maint_req.get('renewal_rate', 0) > 0:
+                total_criteria += 1
+                if renewal_rate < maint_req['renewal_rate']:
+                    critical_failures += 1
             
-            if maintenance_met:
-                return '维持'
-            else:
+            # Only demote if there are multiple critical failures AND it's an assessment month
+            severe_underperformance = (individual_fyc < maint_req.get('individual_fyc', 0) * 0.5)
+            multiple_failures = (critical_failures >= 3)
+            
+            if is_assessment_month and (multiple_failures or severe_underperformance):
                 return '降级'
+            else:
+                return '维持'
         
         # Default fallback
         return '维持'
@@ -952,6 +979,9 @@ def process_assessment_month(df: pd.DataFrame, current_month: int,
         perf_data['GT_subordinates'] = row.get('GT_subordinates', 0)
         perf_data['DT_subordinates'] = row.get('DT_subordinates', 0)
         perf_data['total_subordinates'] = row.get('total_subordinates', 0)
+        
+        # Add assessment month flag for demotion logic
+        perf_data['is_assessment_month'] = True  # This function is only called during assessment months
         
         # Use promotion engine to determine decision
         decision = promotion_engine.evaluate(current_rank, perf_data)
