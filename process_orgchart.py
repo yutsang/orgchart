@@ -32,6 +32,7 @@ warnings.filterwarnings('ignore')
 # File paths and sheet names
 SRC_FILE = "SelfProd_2024.xlsx"
 DST_FILE = "SelfProd_2024_processed.xlsx"
+CHECK_FILE = "SelfProd_2024_promotion_check.xlsx"  # Monthly promotion details
 DATA_SHEET = "Data"
 PROMOTION_SHEET = "PromotionRules"
 DEMOTION_SHEET = "DemotionRules"
@@ -161,7 +162,7 @@ def load_source_data(filepath: str) -> pd.DataFrame:
         xls = pd.ExcelFile(filepath)
         df = xls.parse(DATA_SHEET, dtype=dtype_map, keep_default_na=False)
         print(f"✓ Loaded {len(df)} records from {DATA_SHEET} sheet")
-        return df
+    return df
     except Exception as e:
         raise ValueError(f"Failed to load data from {filepath}: {str(e)}")
 
@@ -374,11 +375,12 @@ class PromotionRuleEngine:
         for rule in self.rules:
             if rule.applies_to(current_rank, performance_data):
                 decision = rule.evaluate(current_rank, performance_data)
-                print(f"    Rule '{rule.name}' applied to {current_rank}: {decision}")
+                # Only log non-default decisions to reduce verbosity
+                if rule.priority > 0:  # Don't log fallback rule applications
+                    print(f"    {rule.name}: {current_rank} → {decision}")
                 return decision
         
-        # Default fallback
-        print(f"    No rules applied to {current_rank}, defaulting to '维持'")
+        # Default fallback (no logging to reduce verbosity)
         return '维持'
 
 def create_default_promotion_engine(promotion_df: pd.DataFrame = None, 
@@ -706,13 +708,11 @@ def create_custom_promotion_engine(promotion_df: pd.DataFrame = None,
     # Add grade-specific rules first (highest priority) - based on Excel images
     grade_specific_rule = GradeSpecificRule("Grade Specific Requirements", priority=5)
     engine.add_rule(grade_specific_rule)
-    print("  Added grade-specific promotion rules from Excel requirements")
     
     # Add Excel-based rules (second highest priority)
     if promotion_df is not None and not promotion_df.empty:
         excel_rule = ExcelBasedRule("Excel Rules", promotion_df, demotion_df or pd.DataFrame(), priority=4)
         engine.add_rule(excel_rule)
-        print("  Added Excel-based promotion rules")
     
     # Add MDRT-based rule for senior positions
     if enable_mdrt_rule:
@@ -722,7 +722,6 @@ def create_custom_promotion_engine(promotion_df: pd.DataFrame = None,
             priority=3
         )
         engine.add_rule(mdrt_rule)
-        print("  Added MDRT-based promotion rule")
     
     # Add composite rules for different rank groups
     if enable_composite_rule:
@@ -747,8 +746,6 @@ def create_custom_promotion_engine(promotion_df: pd.DataFrame = None,
             priority=2
         )
         engine.add_rule(middle_rule)
-        
-        print("  Added composite performance rules")
     
     # Add basic FYC rule for entry-level positions
     entry_rule = FYCBasedRule(
@@ -770,7 +767,7 @@ def create_custom_promotion_engine(promotion_df: pd.DataFrame = None,
     )
     engine.add_rule(fallback_rule)
     
-    print(f"  Promotion engine configured with {len(engine.rules)} rules")
+    print(f"  Configured promotion engine with {len(engine.rules)} rules")
     return engine
 
 # =============================================================================
@@ -909,7 +906,6 @@ def process_assessment_month(df: pd.DataFrame, current_month: int,
                   how='left', suffixes=('', '_累计'))
     
     # Create promotion engine with rules (using custom engine for more flexibility)
-    print("  Initializing promotion rule engine...")
     promotion_engine = create_custom_promotion_engine(
         promotion_rules, 
         demotion_rules,
@@ -938,7 +934,6 @@ def process_assessment_month(df: pd.DataFrame, current_month: int,
                 perf_data[col] = 0
         
         # Use promotion engine to determine decision
-        print(f"  Evaluating {agent_code} ({current_rank})...")
         decision = promotion_engine.evaluate(current_rank, perf_data)
         promotion_decisions.append(decision)
         
@@ -946,8 +941,9 @@ def process_assessment_month(df: pd.DataFrame, current_month: int,
         new_rank = apply_rank_adjustment(current_rank, decision)
         new_ranks.append(new_rank)
         
+        # Only log actual rank changes to reduce verbosity
         if new_rank != current_rank:
-            print(f"    {agent_code}: {current_rank} → {new_rank} ({decision})")
+            print(f"  {agent_code}: {current_rank} → {new_rank} ({decision})")
     
     df['升降级标记'] = promotion_decisions
     df['当前职级'] = new_ranks
@@ -960,7 +956,7 @@ def process_assessment_month(df: pd.DataFrame, current_month: int,
     demotion_count = promotion_decisions.count('降级')
     maintain_count = promotion_decisions.count('维持')
     
-    print(f"  Assessment summary: {promotion_count} promotions, {demotion_count} demotions, {maintain_count} maintained")
+    print(f"  Assessment results: {promotion_count} 晋升, {demotion_count} 降级, {maintain_count} 维持")
     
     return df
 
@@ -1167,7 +1163,7 @@ def format_final_output(df: pd.DataFrame) -> pd.DataFrame:
 # =============================================================================
 
 def process_monthly_data(source_data: pd.DataFrame, promotion_rules: pd.DataFrame,
-                        demotion_rules: pd.DataFrame) -> pd.DataFrame:
+                        demotion_rules: pd.DataFrame) -> Tuple[pd.DataFrame, List[pd.DataFrame]]:
     """
     Process all monthly data according to business rules.
     
@@ -1177,7 +1173,7 @@ def process_monthly_data(source_data: pd.DataFrame, promotion_rules: pd.DataFram
         demotion_rules: Demotion rules DataFrame
         
     Returns:
-        Processed DataFrame with all months
+        Tuple of (processed DataFrame with all months, list of monthly snapshots)
     """
     print("Processing monthly organizational data...")
     
@@ -1190,11 +1186,11 @@ def process_monthly_data(source_data: pd.DataFrame, promotion_rules: pd.DataFram
 
     for month in month_list:
         print(f"\nProcessing month {month}...")
-        
+
         # Extract current month data
         current_df = source_data[source_data['薪资月份'] == month].copy()
         print(f"  {len(current_df)} agents in month {month}")
-        
+
         # Step 1: Apply rank remapping
         current_df = apply_rank_remapping(current_df)
         
@@ -1237,7 +1233,242 @@ def process_monthly_data(source_data: pd.DataFrame, promotion_rules: pd.DataFram
     final_df = format_final_output(final_df)
     
     print(f"Final dataset contains {len(final_df)} records")
-    return final_df
+    return final_df, monthly_snapshots
+
+# =============================================================================
+# PROMOTION CHECK EXCEL GENERATION
+# =============================================================================
+
+def create_monthly_promotion_check(monthly_snapshots: List[pd.DataFrame], 
+                                  source_data: pd.DataFrame) -> None:
+    """
+    Create a detailed Excel file with monthly promotion/demotion analysis.
+    One tab per month showing all promotion decisions and supporting data.
+    
+    Args:
+        monthly_snapshots: List of monthly DataFrame snapshots
+        source_data: Original source data for reference
+    """
+    print(f"\nGenerating promotion check file: {CHECK_FILE}")
+    
+    with pd.ExcelWriter(CHECK_FILE, engine='openpyxl') as writer:
+        
+        # Create summary sheet first
+        create_promotion_summary_sheet(monthly_snapshots, writer)
+        
+        # Create detailed monthly sheets
+        for i, monthly_df in enumerate(monthly_snapshots):
+            month = monthly_df['薪资月份'].iloc[0] if not monthly_df.empty else f"Month_{i+1}"
+            month_str = str(month)
+            
+            # Check if this is an assessment month
+            is_assessment_month = month in ASSESS_MONTHS
+            
+            if is_assessment_month:
+                print(f"  Creating assessment details for {month_str}")
+                create_assessment_month_sheet(monthly_df, month, writer, source_data)
+            else:
+                print(f"  Creating regular month summary for {month_str}")
+                create_regular_month_sheet(monthly_df, month, writer)
+
+def create_promotion_summary_sheet(monthly_snapshots: List[pd.DataFrame], 
+                                 writer: pd.ExcelWriter) -> None:
+    """Create summary sheet with overall promotion statistics."""
+    
+    summary_data = []
+    
+    for monthly_df in monthly_snapshots:
+        if monthly_df.empty:
+            continue
+            
+        month = monthly_df['薪资月份'].iloc[0]
+        is_assessment = month in ASSESS_MONTHS
+        
+        # Count promotion decisions
+        if '升降级标记' in monthly_df.columns:
+            promotion_count = (monthly_df['升降级标记'] == '晋升').sum()
+            demotion_count = (monthly_df['升降级标记'] == '降级').sum()
+            maintain_count = (monthly_df['升降级标记'] == '维持').sum()
+        else:
+            promotion_count = demotion_count = maintain_count = 0
+        
+        # Count employee status
+        new_hires = (monthly_df['员工状态'] == '新增').sum() if '员工状态' in monthly_df.columns else 0
+        resignations = (monthly_df['员工状态'] == '离职').sum() if '员工状态' in monthly_df.columns else 0
+        active = (monthly_df['员工状态'] == '在职').sum() if '员工状态' in monthly_df.columns else len(monthly_df)
+        
+        summary_data.append({
+            '月份': month,
+            '考核月': '是' if is_assessment else '否',
+            '总人数': len(monthly_df),
+            '新增人员': new_hires,
+            '离职人员': resignations,
+            '在职人员': active,
+            '晋升人数': promotion_count,
+            '降级人数': demotion_count,
+            '维持人数': maintain_count,
+            '晋升率': f"{promotion_count/len(monthly_df)*100:.1f}%" if len(monthly_df) > 0 else "0%",
+            '降级率': f"{demotion_count/len(monthly_df)*100:.1f}%" if len(monthly_df) > 0 else "0%"
+        })
+    
+    summary_df = pd.DataFrame(summary_data)
+    summary_df.to_excel(writer, sheet_name='Summary', index=False)
+    
+    # Auto-adjust column widths
+    worksheet = writer.sheets['Summary']
+    for column in worksheet.columns:
+        max_length = 0
+        column_letter = column[0].column_letter
+        for cell in column:
+            try:
+                if len(str(cell.value)) > max_length:
+                    max_length = len(str(cell.value))
+            except:
+                pass
+        adjusted_width = min(max_length + 2, 50)
+        worksheet.column_dimensions[column_letter].width = adjusted_width
+
+def create_assessment_month_sheet(monthly_df: pd.DataFrame, month: int, 
+                                writer: pd.ExcelWriter, source_data: pd.DataFrame) -> None:
+    """Create detailed sheet for assessment months with promotion analysis."""
+    
+    sheet_name = f"{month}_Assessment"
+    
+    # Filter for agents with promotion decisions
+    assessment_df = monthly_df.copy()
+    
+    # Get assessment window data
+    assessment_months = calculate_assessment_window(month, PROMOTION_WINDOW)
+    window_data = source_data[source_data['薪资月份'].isin(assessment_months)]
+    
+    # Calculate performance aggregations for context
+    perf_agg = {}
+    agg_rules = {
+        '承保FYC': 'sum',
+        '个险折算后FYC': 'sum',
+        '直辖FYC': 'sum',
+        '所辖FYC': 'sum',
+        '续保率': 'mean',
+        '新单件数': 'sum',
+        '直辖人力': 'mean',
+        '所辖人力': 'mean'
+    }
+    
+    for col, agg_func in agg_rules.items():
+        if col in window_data.columns:
+            perf_agg[col] = agg_func
+    
+    if perf_agg:
+        perf_df = window_data.groupby('营销员代码').agg(perf_agg)
+        assessment_df = assessment_df.merge(perf_df, left_on='营销员代码', 
+                                          right_index=True, how='left', suffixes=('', '_6个月累计'))
+    
+    # Select key columns for the check sheet
+    check_columns = [
+        '营销员代码', '当前职级', '升降级标记', '员工状态',
+        '承保FYC_6个月累计', '个险折算后FYC_6个月累计', '直辖FYC_6个月累计', '所辖FYC_6个月累计',
+        '续保率_6个月累计', '新单件数_6个月累计', '直辖人力_6个月累计', '所辖人力_6个月累计',
+        '直属主管代码', '上级主管代码', '主管关系'
+    ]
+    
+    # Only include columns that exist
+    available_columns = [col for col in check_columns if col in assessment_df.columns]
+    check_df = assessment_df[available_columns].copy()
+    
+    # Sort by promotion decision and then by agent code
+    sort_order = {'晋升': 0, '降级': 1, '维持': 2}
+    if '升降级标记' in check_df.columns:
+        check_df['_sort_order'] = check_df['升降级标记'].map(sort_order).fillna(3)
+        check_df = check_df.sort_values(['_sort_order', '营销员代码'])
+        check_df = check_df.drop('_sort_order', axis=1)
+    
+    # Write to Excel
+    check_df.to_excel(writer, sheet_name=sheet_name, index=False)
+    
+    # Format the worksheet
+    format_assessment_worksheet(writer.sheets[sheet_name], check_df)
+
+def create_regular_month_sheet(monthly_df: pd.DataFrame, month: int, 
+                             writer: pd.ExcelWriter) -> None:
+    """Create summary sheet for regular (non-assessment) months."""
+    
+    sheet_name = f"{month}_Regular"
+    
+    # Select key columns for regular months
+    regular_columns = [
+        '营销员代码', '当前职级', '员工状态', 'RANK_LAYER',
+        '直属主管代码', '上级主管代码', '主管关系',
+        '承保FYC', '个险折算后FYC', '续保率'
+    ]
+    
+    # Only include columns that exist
+    available_columns = [col for col in regular_columns if col in monthly_df.columns]
+    regular_df = monthly_df[available_columns].copy()
+    
+    # Sort by rank layer and agent code
+    if 'RANK_LAYER' in regular_df.columns:
+        regular_df = regular_df.sort_values(['RANK_LAYER', '营销员代码'])
+                else:
+        regular_df = regular_df.sort_values(['营销员代码'])
+    
+    # Write to Excel
+    regular_df.to_excel(writer, sheet_name=sheet_name, index=False)
+    
+    # Auto-adjust column widths
+    worksheet = writer.sheets[sheet_name]
+    for column in worksheet.columns:
+        max_length = 0
+        column_letter = column[0].column_letter
+        for cell in column:
+            try:
+                if len(str(cell.value)) > max_length:
+                    max_length = len(str(cell.value))
+            except:
+                pass
+        adjusted_width = min(max_length + 2, 30)
+        worksheet.column_dimensions[column_letter].width = adjusted_width
+
+def format_assessment_worksheet(worksheet, df: pd.DataFrame) -> None:
+    """Apply formatting to assessment worksheet for better readability."""
+    
+    # Auto-adjust column widths
+    for column in worksheet.columns:
+        max_length = 0
+        column_letter = column[0].column_letter
+        for cell in column:
+            try:
+                if len(str(cell.value)) > max_length:
+                    max_length = len(str(cell.value))
+            except:
+                pass
+        adjusted_width = min(max_length + 2, 30)
+        worksheet.column_dimensions[column_letter].width = adjusted_width
+    
+    # Color code promotion decisions if available
+    if '升降级标记' in df.columns:
+        from openpyxl.styles import PatternFill
+        
+        # Define colors
+        promotion_fill = PatternFill(start_color="90EE90", end_color="90EE90", fill_type="solid")  # Light green
+        demotion_fill = PatternFill(start_color="FFB6C1", end_color="FFB6C1", fill_type="solid")   # Light red
+        maintain_fill = PatternFill(start_color="F0F8FF", end_color="F0F8FF", fill_type="solid")   # Light blue
+        
+        # Find the column index for 升降级标记
+        decision_col_idx = None
+        for idx, col in enumerate(df.columns):
+            if col == '升降级标记':
+                decision_col_idx = idx + 1  # Excel columns are 1-indexed
+                break
+        
+        if decision_col_idx:
+            for row_idx in range(2, len(df) + 2):  # Start from row 2 (after header)
+                cell = worksheet.cell(row=row_idx, column=decision_col_idx)
+                if cell.value == '晋升':
+                    cell.fill = promotion_fill
+                elif cell.value == '降级':
+                    cell.fill = demotion_fill
+                elif cell.value == '维持':
+                    cell.fill = maintain_fill
 
 # =============================================================================
 # MAIN EXECUTION FUNCTION
@@ -1262,16 +1493,21 @@ def main():
         
         # Step 3: Process all monthly data
         print("\n3. Processing monthly data...")
-        processed_df = process_monthly_data(source_data, promotion_rules, demotion_rules)
+        processed_df, monthly_snapshots = process_monthly_data(source_data, promotion_rules, demotion_rules)
         
-        # Step 4: Save output
-        print(f"\n4. Saving output to {DST_FILE}...")
-        processed_df.to_excel(DST_FILE, index=False, encoding='utf-8')
+        # Step 4: Save main output
+        print(f"\n4. Saving main output to {DST_FILE}...")
+        processed_df.to_excel(DST_FILE, index=False)
+        
+        # Step 5: Generate promotion check file
+        print(f"\n5. Generating promotion check file...")
+        create_monthly_promotion_check(monthly_snapshots, source_data)
         
         # Success message
         print("\n" + "=" * 70)
         print(f"✅ SUCCESS! Processing completed successfully.")
-        print(f"✅ Output saved to: {DST_FILE}")
+        print(f"✅ Main output saved to: {DST_FILE}")
+        print(f"✅ Promotion check file saved to: {CHECK_FILE}")
         print(f"✅ Total records processed: {len(processed_df):,}")
         print(f"✅ Months covered: {sorted(processed_df['薪资月份'].unique())}")
         print("=" * 70)
