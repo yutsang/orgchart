@@ -375,8 +375,8 @@ class PromotionRuleEngine:
         for rule in self.rules:
             if rule.applies_to(current_rank, performance_data):
                 decision = rule.evaluate(current_rank, performance_data)
-                # Only log non-default decisions to reduce verbosity
-                if rule.priority > 0:  # Don't log fallback rule applications
+                # Only log significant decisions (promotions/demotions) to reduce verbosity
+                if rule.priority > 0 and decision != '维持':
                     print(f"    {rule.name}: {current_rank} → {decision}")
                 return decision
         
@@ -502,15 +502,6 @@ class GradeSpecificRule(PromotionRule):
         super().__init__(name, priority)
         # Define specific requirements for each grade transition
         self.promotion_requirements = {
-            'CA': {  # CA → AS
-                'target_rank': 'AS',
-                'time_requirement': 3,  # months
-                'individual_fyc': 9000,
-                'direct_fyc': 0,
-                'group_fyc': 0,
-                'renewal_rate': 0.85,
-                'team_size': 0
-            },
             'AS': {  # AS → BM0 or BM1 (depending on performance)
                 'target_rank': 'BM0',  # Default target
                 'alternative_target': 'BM1',  # Higher performance target
@@ -600,7 +591,7 @@ class GradeSpecificRule(PromotionRule):
         return current_rank in self.promotion_requirements or current_rank in self.maintenance_requirements
     
     def evaluate(self, current_rank: str, performance_data: Dict) -> str:
-        """Evaluate based on grade-specific requirements."""
+        """Evaluate based on grade-specific requirements with GT/DT relationship validation."""
         # Check promotion first
         if current_rank in self.promotion_requirements:
             req = self.promotion_requirements[current_rank]
@@ -612,36 +603,60 @@ class GradeSpecificRule(PromotionRule):
             renewal_rate = performance_data.get('续保率', 0) or 0
             team_size = performance_data.get('直辖人力', 0) or performance_data.get('所辖人力', 0) or 0
             
+            # Get GT/DT relationship counts for leadership validation
+            gt_count = performance_data.get('GT_subordinates', 0) or 0
+            dt_count = performance_data.get('DT_subordinates', 0) or 0
+            total_subordinates = performance_data.get('total_subordinates', 0) or 0
+            
             # Check if promotion criteria are met
             promotion_met = True
+            criteria_failed = []
             
             if req['individual_fyc'] > 0 and individual_fyc < req['individual_fyc']:
                 promotion_met = False
+                criteria_failed.append(f"个人FYC {individual_fyc:,.0f} < {req['individual_fyc']:,.0f}")
             
             if req['direct_fyc'] > 0 and direct_fyc < req['direct_fyc']:
                 promotion_met = False
+                criteria_failed.append(f"直辖FYC {direct_fyc:,.0f} < {req['direct_fyc']:,.0f}")
             
             if req['group_fyc'] > 0 and group_fyc < req['group_fyc']:
                 promotion_met = False
+                criteria_failed.append(f"所辖FYC {group_fyc:,.0f} < {req['group_fyc']:,.0f}")
                 
             if req['renewal_rate'] > 0 and renewal_rate < req['renewal_rate']:
                 promotion_met = False
+                criteria_failed.append(f"续保率 {renewal_rate:.1%} < {req['renewal_rate']:.1%}")
                 
-            if req['team_size'] > 0 and team_size < req['team_size']:
+            if req['team_size'] > 0 and total_subordinates < req['team_size']:
                 promotion_met = False
+                criteria_failed.append(f"团队规模 {total_subordinates} < {req['team_size']}")
+            
+            # Additional GT/DT relationship validation for management roles
+            if current_rank in ['BM1', 'BM2', 'BM3', 'AD0', 'AD1']:
+                min_dt_ratio = 0.6  # At least 60% DT relationships for senior roles
+                if total_subordinates > 0:
+                    dt_ratio = dt_count / total_subordinates
+                    if dt_ratio < min_dt_ratio:
+                        promotion_met = False
+                        criteria_failed.append(f"DT比例 {dt_ratio:.1%} < {min_dt_ratio:.1%}")
             
             # Check for alternative promotion path (AS → BM1, BM2 → AD0)
             if not promotion_met and 'alternative_target' in req:
                 alt_promotion_met = True
+                alt_criteria_failed = []
                 
                 if req.get('direct_fyc_alt', 0) > 0 and direct_fyc < req['direct_fyc_alt']:
                     alt_promotion_met = False
+                    alt_criteria_failed.append(f"直辖FYC {direct_fyc:,.0f} < {req['direct_fyc_alt']:,.0f}")
                     
                 if req.get('group_fyc_alt', 0) > 0 and group_fyc < req['group_fyc_alt']:
                     alt_promotion_met = False
+                    alt_criteria_failed.append(f"所辖FYC {group_fyc:,.0f} < {req['group_fyc_alt']:,.0f}")
                     
-                if req.get('team_size_alt', 0) > 0 and team_size < req['team_size_alt']:
+                if req.get('team_size_alt', 0) > 0 and total_subordinates < req['team_size_alt']:
                     alt_promotion_met = False
+                    alt_criteria_failed.append(f"团队规模 {total_subordinates} < {req['team_size_alt']}")
                 
                 if alt_promotion_met:
                     return '晋升'  # Alternative promotion path
@@ -933,6 +948,11 @@ def process_assessment_month(df: pd.DataFrame, current_month: int,
             else:
                 perf_data[col] = 0
         
+        # Add GT/DT relationship counts for leadership validation
+        perf_data['GT_subordinates'] = row.get('GT_subordinates', 0)
+        perf_data['DT_subordinates'] = row.get('DT_subordinates', 0)
+        perf_data['total_subordinates'] = row.get('total_subordinates', 0)
+        
         # Use promotion engine to determine decision
         decision = promotion_engine.evaluate(current_rank, perf_data)
         promotion_decisions.append(decision)
@@ -964,9 +984,124 @@ def process_assessment_month(df: pd.DataFrame, current_month: int,
 # SUPERVISOR RELATIONSHIP MANAGEMENT
 # =============================================================================
 
+def validate_supervisor_hierarchy(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Recursively validate and fix supervisor hierarchy to ensure proper rank relationships.
+    
+    Args:
+        df: DataFrame with current organizational data
+        
+    Returns:
+        DataFrame with validated supervisor relationships
+    """
+    df = df.copy()
+    
+    # Create lookup dictionaries
+    agent_rank_lookup = df.set_index('营销员代码')['当前职级'].to_dict()
+    supervisor_lookup = df.set_index('营销员代码')['上级主管代码'].to_dict()
+    
+    def get_rank_hierarchy_level(rank: str) -> int:
+        """Get numerical level for rank comparison (higher number = higher rank)."""
+        try:
+            return RANK_HIERARCHY.index(rank)
+        except ValueError:
+            return -1  # Unknown rank
+    
+    def find_valid_supervisor(agent_code: str, visited: Set[str] = None) -> str:
+        """Recursively find a valid supervisor who outranks the agent."""
+        if visited is None:
+            visited = set()
+            
+        if agent_code in visited:
+            return ''  # Circular reference
+            
+        visited.add(agent_code)
+        agent_rank = agent_rank_lookup.get(agent_code, '')
+        agent_level = get_rank_hierarchy_level(agent_rank)
+        
+        current_supervisor = supervisor_lookup.get(agent_code, '')
+        if not current_supervisor:
+            return ''
+            
+        supervisor_rank = agent_rank_lookup.get(current_supervisor, '')
+        supervisor_level = get_rank_hierarchy_level(supervisor_rank)
+        
+        # If supervisor outranks agent, this is valid
+        if supervisor_level > agent_level:
+            return current_supervisor
+            
+        # If supervisor is same or lower rank, try to find their supervisor
+        return find_valid_supervisor(current_supervisor, visited)
+    
+    # Initialize 育成主管代码 if not exists
+    if '育成主管代码' not in df.columns:
+        df['育成主管代码'] = ''
+    
+    # Process each agent to validate hierarchy
+    hierarchy_fixes = 0
+    for idx, row in df.iterrows():
+        agent_code = row['营销员代码']
+        current_supervisor = row['上级主管代码']
+        
+        if pd.isna(current_supervisor) or current_supervisor == '':
+            continue
+            
+        # Find valid supervisor
+        valid_supervisor = find_valid_supervisor(agent_code)
+        
+        # If we found a different valid supervisor, update relationships
+        if valid_supervisor != current_supervisor and valid_supervisor:
+            df.at[idx, '育成主管代码'] = current_supervisor  # Store original as mentor
+            df.at[idx, '上级主管代码'] = valid_supervisor
+            hierarchy_fixes += 1
+    
+    if hierarchy_fixes > 0:
+        print(f"  Fixed {hierarchy_fixes} supervisor hierarchy conflicts")
+    
+    return df
+
+def calculate_team_relationships(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Calculate GT/DT relationship counts for each agent.
+    
+    Args:
+        df: DataFrame with organizational data
+        
+    Returns:
+        DataFrame with relationship counts added
+    """
+    df = df.copy()
+    
+    # Initialize relationship count columns
+    df['GT_subordinates'] = 0
+    df['DT_subordinates'] = 0
+    df['total_subordinates'] = 0
+    
+    # Count subordinates for each supervisor
+    for supervisor_code in df['营销员代码'].unique():
+        # Find all subordinates of this supervisor
+        subordinates = df[df['上级主管代码'] == supervisor_code]
+        
+        if subordinates.empty:
+            continue
+            
+        # Count GT and DT relationships
+        gt_count = (subordinates['主管关系'] == 'GT').sum()
+        dt_count = (subordinates['主管关系'] == 'DT').sum()
+        total_count = len(subordinates)
+        
+        # Update supervisor's counts
+        supervisor_idx = df[df['营销员代码'] == supervisor_code].index
+        if not supervisor_idx.empty:
+            df.loc[supervisor_idx, 'GT_subordinates'] = gt_count
+            df.loc[supervisor_idx, 'DT_subordinates'] = dt_count
+            df.loc[supervisor_idx, 'total_subordinates'] = total_count
+    
+    return df
+
 def update_supervisor_relationships(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Update supervisor relationships based on layer rules.
+    Update supervisor relationships with comprehensive validation and GT/DT counting.
     
     Args:
         df: DataFrame with current organizational data
@@ -976,36 +1111,14 @@ def update_supervisor_relationships(df: pd.DataFrame) -> pd.DataFrame:
     """
     df = df.copy()
     
-    # Create supervisor lookup for getting supervisor's supervisor
-    supervisor_lookup = df.set_index('营销员代码')['上级主管代码'].to_dict()
+    # Step 1: Validate supervisor hierarchy recursively
+    df = validate_supervisor_hierarchy(df)
     
-    # Initialize 育成主管代码 if not exists
-    if '育成主管代码' not in df.columns:
-        df['育成主管代码'] = ''
+    # Step 2: Apply relationship rules
+    df = apply_relationship_rules(df)
     
-    # Process each agent
-    for idx, row in df.iterrows():
-        agent_layer = row.get('RANK_LAYER')
-        supervisor_code = row['上级主管代码']
-        
-        if pd.isna(supervisor_code) or supervisor_code == '':
-            continue
-            
-        # Find supervisor's rank and layer
-        supervisor_data = df[df['营销员代码'] == supervisor_code]
-        if supervisor_data.empty:
-            continue
-            
-        supervisor_rank = supervisor_data.iloc[0]['当前职级']
-        supervisor_layer = LAYER_MAP.get(supervisor_rank)
-        
-        # Check if agent and supervisor are in same layer
-        if agent_layer is not None and supervisor_layer == agent_layer:
-            # Move supervisor up one level
-            supervisor_supervisor = supervisor_lookup.get(supervisor_code, '')
-            if supervisor_supervisor:
-                df.at[idx, '上级主管代码'] = supervisor_supervisor
-                df.at[idx, '育成主管代码'] = supervisor_code
+    # Step 3: Calculate team relationship counts
+    df = calculate_team_relationships(df)
     
     return df
 
@@ -1214,9 +1327,8 @@ def process_monthly_data(source_data: pd.DataFrame, promotion_rules: pd.DataFram
             
         current_df = apply_employee_status(current_df, new_hires, resignations)
         
-        # Step 4: Update supervisor relationships
+        # Step 4: Update supervisor relationships (includes validation and GT/DT counting)
         current_df = update_supervisor_relationships(current_df)
-        current_df = apply_relationship_rules(current_df)
         
         # Step 5: Create output columns
         current_df = create_output_columns(current_df)
