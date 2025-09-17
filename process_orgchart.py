@@ -248,8 +248,8 @@ class FYCBasedRule(PromotionRule):
             return '晋升'
         elif fyc_total >= self.maintain_threshold:
             return '维持'
-        elif is_assessment_month and fyc_total < (self.maintain_threshold * 0.5):
-            # Only demote if performance is less than 50% of maintain threshold during assessment
+        elif is_assessment_month and fyc_total > 0 and fyc_total < (self.maintain_threshold * 0.2):
+            # Only demote if performance is less than 20% of maintain threshold AND has data
             return '降级'
         else:
             return '维持'  # Conservative: maintain instead of demote
@@ -382,6 +382,17 @@ class PromotionRuleEngine:
     
     def evaluate(self, current_rank: str, performance_data: Dict) -> str:
         """Evaluate promotion decision using all applicable rules."""
+        # Safety check: if no meaningful performance data, always maintain
+        has_any_performance_data = (
+            performance_data.get('承保FYC', 0) > 0 or 
+            performance_data.get('直辖FYC', 0) > 0 or 
+            performance_data.get('个险折算后FYC', 0) > 0 or
+            performance_data.get('所辖FYC', 0) > 0
+        )
+        
+        if not has_any_performance_data:
+            return '维持'  # No data = maintain (never demote)
+        
         for rule in self.rules:
             if rule.applies_to(current_rank, performance_data):
                 decision = rule.evaluate(current_rank, performance_data)
@@ -597,8 +608,18 @@ class GradeSpecificRule(PromotionRule):
         }
     
     def applies_to(self, current_rank: str, performance_data: Dict) -> bool:
-        """Rule applies to all ranks that have defined requirements."""
-        return current_rank in self.promotion_requirements or current_rank in self.maintenance_requirements
+        """Rule applies only to ranks with defined requirements AND sufficient performance data."""
+        has_requirements = (current_rank in self.promotion_requirements or 
+                          current_rank in self.maintenance_requirements)
+        
+        # Only apply if we have meaningful performance data
+        has_performance_data = (
+            performance_data.get('承保FYC', 0) > 0 or 
+            performance_data.get('直辖FYC', 0) > 0 or 
+            performance_data.get('个险折算后FYC', 0) > 0
+        )
+        
+        return has_requirements and has_performance_data
     
     def evaluate(self, current_rank: str, performance_data: Dict) -> str:
         """Evaluate based on grade-specific requirements with GT/DT relationship validation."""
@@ -677,8 +698,8 @@ class GradeSpecificRule(PromotionRule):
             if promotion_met:
                 return '晋升'
         
-        # Check maintenance requirements
-        if current_rank in self.maintenance_requirements:
+        # Check maintenance requirements (VERY conservative - only for extreme cases)
+        if current_rank in self.maintenance_requirements and is_assessment_month:
             maint_req = self.maintenance_requirements[current_rank]
             
             # Get performance metrics
@@ -686,41 +707,25 @@ class GradeSpecificRule(PromotionRule):
             direct_fyc = performance_data.get('直辖FYC', 0) or performance_data.get('个险折算后FYC', 0) or 0
             group_fyc = performance_data.get('所辖FYC', 0) or 0
             renewal_rate = performance_data.get('续保率', 0) or 0
-            team_size = performance_data.get('直辖人力', 0) or performance_data.get('所辖人力', 0) or 0
             
-            # Check if maintenance criteria are met (more lenient - only demote for severe underperformance)
-            critical_failures = 0
-            total_criteria = 0
+            # EXTREMELY conservative demotion logic - only demote for truly awful performance
+            # Must have meaningful data AND be severely underperforming
+            has_meaningful_data = (individual_fyc > 0 or direct_fyc > 0)
             
-            # Check individual FYC (most important)
-            if maint_req.get('individual_fyc', 0) > 0:
-                total_criteria += 1
-                if individual_fyc < maint_req['individual_fyc']:
-                    critical_failures += 2  # Weight individual performance heavily
+            if not has_meaningful_data:
+                return '维持'  # No data = maintain (don't demote)
             
-            # Check direct team FYC
-            if maint_req.get('direct_fyc', 0) > 0:
-                total_criteria += 1
-                if direct_fyc < maint_req['direct_fyc']:
-                    critical_failures += 1
+            # Only demote if BOTH individual AND team performance are severely below threshold
+            individual_threshold = maint_req.get('individual_fyc', 0)
+            direct_threshold = maint_req.get('direct_fyc', 0)
             
-            # Check group FYC (for senior roles)
-            if maint_req.get('group_fyc', 0) > 0:
-                total_criteria += 1
-                if group_fyc < maint_req['group_fyc']:
-                    critical_failures += 1
-                    
-            # Check renewal rate (quality indicator)
-            if maint_req.get('renewal_rate', 0) > 0:
-                total_criteria += 1
-                if renewal_rate < maint_req['renewal_rate']:
-                    critical_failures += 1
+            severe_individual_failure = (individual_threshold > 0 and 
+                                       individual_fyc < individual_threshold * 0.3)  # 30% of threshold
+            severe_team_failure = (direct_threshold > 0 and 
+                                 direct_fyc < direct_threshold * 0.3)  # 30% of threshold
             
-            # Only demote if there are multiple critical failures AND it's an assessment month
-            severe_underperformance = (individual_fyc < maint_req.get('individual_fyc', 0) * 0.5)
-            multiple_failures = (critical_failures >= 3)
-            
-            if is_assessment_month and (multiple_failures or severe_underperformance):
+            # Only demote if BOTH individual AND team are severely underperforming
+            if severe_individual_failure and severe_team_failure:
                 return '降级'
             else:
                 return '维持'
@@ -1007,6 +1012,16 @@ def process_assessment_month(df: pd.DataFrame, current_month: int,
     maintain_count = promotion_decisions.count('维持')
     
     print(f"  Assessment results: {promotion_count} 晋升, {demotion_count} 降级, {maintain_count} 维持")
+    
+    # Debug: show some examples of demotions if there are too many
+    if demotion_count > 100:
+        print("  ⚠️  Warning: Excessive demotions detected!")
+        demoted_agents = df[df['升降级标记'] == '降级'].head(5)
+        for _, agent in demoted_agents.iterrows():
+            agent_code = agent.get('营销员代码', 'N/A')
+            rank = agent.get('当前职级', 'N/A')
+            fyc = agent.get('承保FYC_累计', 0) or agent.get('承保FYC', 0)
+            print(f"    Example demotion: {agent_code} ({rank}) FYC: {fyc:,.0f}")
     
     return df
 
