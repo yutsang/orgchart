@@ -162,7 +162,7 @@ def load_source_data(filepath: str) -> pd.DataFrame:
         xls = pd.ExcelFile(filepath)
         df = xls.parse(DATA_SHEET, dtype=dtype_map, keep_default_na=False)
         print(f"✓ Loaded {len(df)} records from {DATA_SHEET} sheet")
-    return df
+        return df
     except Exception as e:
         raise ValueError(f"Failed to load data from {filepath}: {str(e)}")
 
@@ -1408,7 +1408,7 @@ def create_regular_month_sheet(monthly_df: pd.DataFrame, month: int,
     # Sort by rank layer and agent code
     if 'RANK_LAYER' in regular_df.columns:
         regular_df = regular_df.sort_values(['RANK_LAYER', '营销员代码'])
-                else:
+    else:
         regular_df = regular_df.sort_values(['营销员代码'])
     
     # Write to Excel
