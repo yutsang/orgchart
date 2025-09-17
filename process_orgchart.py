@@ -64,7 +64,8 @@ DEFAULT_MAINTAIN_THRESHOLD = 120000   # 承保FYC累计
 
 # Performance columns for assessment
 PERFORMANCE_COLUMNS = [
-    '续保率', '承保FYC', '个险折算后FYC', '新单件数', '是否MDRT'
+    '续保率', '承保FYC', '个险折算后FYC', '新单件数', '是否MDRT',
+    '直辖FYC', '所辖FYC', '直辖人力', '所辖人力'  # Additional columns for grade-specific rules
 ]
 
 # Output columns in required order
@@ -74,6 +75,7 @@ OUTPUT_COLUMNS = [
     '业务主任代码', '业务主任职级', '业务主任关系',
     '一代育成人', '二代育成人'
 ]
+
 
 # =============================================================================
 # UTILITY FUNCTIONS
@@ -199,6 +201,579 @@ def load_promotion_rules(filepath: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
         return pd.DataFrame(), pd.DataFrame()
 
 # =============================================================================
+# PROMOTION RULE ENGINE - MODULAR SYSTEM
+# =============================================================================
+
+class PromotionRule:
+    """Base class for promotion rules."""
+    
+    def __init__(self, name: str, priority: int = 0):
+        self.name = name
+        self.priority = priority  # Higher priority rules are evaluated first
+    
+    def applies_to(self, current_rank: str, performance_data: Dict) -> bool:
+        """Check if this rule applies to the given agent."""
+        raise NotImplementedError
+    
+    def evaluate(self, current_rank: str, performance_data: Dict) -> str:
+        """Evaluate and return decision: '晋升', '维持', or '降级'."""
+        raise NotImplementedError
+
+class FYCBasedRule(PromotionRule):
+    """FYC-based promotion rule."""
+    
+    def __init__(self, name: str, rank_filter: List[str] = None, 
+                 promotion_threshold: float = 250000, maintain_threshold: float = 120000,
+                 priority: int = 1):
+        super().__init__(name, priority)
+        self.rank_filter = rank_filter or []
+        self.promotion_threshold = promotion_threshold
+        self.maintain_threshold = maintain_threshold
+    
+    def applies_to(self, current_rank: str, performance_data: Dict) -> bool:
+        """Rule applies if no rank filter or rank is in filter."""
+        return not self.rank_filter or current_rank in self.rank_filter
+    
+    def evaluate(self, current_rank: str, performance_data: Dict) -> str:
+        """Evaluate based on FYC thresholds."""
+        fyc_total = performance_data.get('承保FYC', 0)
+        if pd.isna(fyc_total):
+            fyc_total = 0
+            
+        if fyc_total >= self.promotion_threshold:
+            return '晋升'
+        elif fyc_total >= self.maintain_threshold:
+            return '维持'
+        else:
+            return '降级'
+
+class CompositeRule(PromotionRule):
+    """Rule that combines multiple performance metrics."""
+    
+    def __init__(self, name: str, rank_filter: List[str] = None,
+                 fyc_threshold: float = 200000, renewal_rate_threshold: float = 0.85,
+                 new_policies_threshold: int = 10, priority: int = 2):
+        super().__init__(name, priority)
+        self.rank_filter = rank_filter or []
+        self.fyc_threshold = fyc_threshold
+        self.renewal_rate_threshold = renewal_rate_threshold
+        self.new_policies_threshold = new_policies_threshold
+    
+    def applies_to(self, current_rank: str, performance_data: Dict) -> bool:
+        """Rule applies if no rank filter or rank is in filter."""
+        return not self.rank_filter or current_rank in self.rank_filter
+    
+    def evaluate(self, current_rank: str, performance_data: Dict) -> str:
+        """Evaluate based on multiple criteria."""
+        fyc = performance_data.get('承保FYC', 0) or 0
+        renewal_rate = performance_data.get('续保率', 0) or 0
+        new_policies = performance_data.get('新单件数', 0) or 0
+        
+        # Count how many criteria are met
+        criteria_met = 0
+        total_criteria = 3
+        
+        if fyc >= self.fyc_threshold:
+            criteria_met += 1
+        if renewal_rate >= self.renewal_rate_threshold:
+            criteria_met += 1
+        if new_policies >= self.new_policies_threshold:
+            criteria_met += 1
+        
+        # Decision based on criteria met
+        if criteria_met >= 3:
+            return '晋升'
+        elif criteria_met >= 2:
+            return '维持'
+        else:
+            return '降级'
+
+class ExcelBasedRule(PromotionRule):
+    """Rule that reads criteria from Excel sheets."""
+    
+    def __init__(self, name: str, promotion_df: pd.DataFrame, demotion_df: pd.DataFrame,
+                 priority: int = 3):
+        super().__init__(name, priority)
+        self.promotion_df = promotion_df
+        self.demotion_df = demotion_df
+    
+    def applies_to(self, current_rank: str, performance_data: Dict) -> bool:
+        """Rule applies if we have rules for this rank."""
+        return (not self.promotion_df.empty and 
+                current_rank in self.promotion_df.get('当前职级', []))
+    
+    def evaluate(self, current_rank: str, performance_data: Dict) -> str:
+        """Evaluate based on Excel-defined rules."""
+        if self.promotion_df.empty:
+            return '维持'
+        
+        # Find rules for current rank
+        rank_rules = self.promotion_df[self.promotion_df['当前职级'] == current_rank]
+        if rank_rules.empty:
+            return '维持'
+        
+        # Check promotion criteria (take first matching rule)
+        rule = rank_rules.iloc[0]
+        
+        # Check each criterion
+        promotion_criteria_met = True
+        
+        if '承保FYC要求' in rule and pd.notna(rule['承保FYC要求']):
+            fyc = performance_data.get('承保FYC', 0) or 0
+            if fyc < rule['承保FYC要求']:
+                promotion_criteria_met = False
+        
+        if '续保率要求' in rule and pd.notna(rule['续保率要求']):
+            renewal_rate = performance_data.get('续保率', 0) or 0
+            if renewal_rate < rule['续保率要求']:
+                promotion_criteria_met = False
+        
+        if '新单件数要求' in rule and pd.notna(rule['新单件数要求']):
+            new_policies = performance_data.get('新单件数', 0) or 0
+            if new_policies < rule['新单件数要求']:
+                promotion_criteria_met = False
+        
+        if promotion_criteria_met:
+            return '晋升'
+        
+        # Check demotion criteria
+        if not self.demotion_df.empty:
+            demotion_rules = self.demotion_df[self.demotion_df['当前职级'] == current_rank]
+            if not demotion_rules.empty:
+                demo_rule = demotion_rules.iloc[0]
+                demotion_triggered = False
+                
+                if '承保FYC下限' in demo_rule and pd.notna(demo_rule['承保FYC下限']):
+                    fyc = performance_data.get('承保FYC', 0) or 0
+                    if fyc < demo_rule['承保FYC下限']:
+                        demotion_triggered = True
+                
+                if demotion_triggered:
+                    return '降级'
+        
+        return '维持'
+
+class PromotionRuleEngine:
+    """Engine that manages and applies promotion rules."""
+    
+    def __init__(self):
+        self.rules: List[PromotionRule] = []
+    
+    def add_rule(self, rule: PromotionRule):
+        """Add a rule to the engine."""
+        self.rules.append(rule)
+        # Sort by priority (higher priority first)
+        self.rules.sort(key=lambda r: r.priority, reverse=True)
+    
+    def clear_rules(self):
+        """Clear all rules."""
+        self.rules = []
+    
+    def evaluate(self, current_rank: str, performance_data: Dict) -> str:
+        """Evaluate promotion decision using all applicable rules."""
+        for rule in self.rules:
+            if rule.applies_to(current_rank, performance_data):
+                decision = rule.evaluate(current_rank, performance_data)
+                print(f"    Rule '{rule.name}' applied to {current_rank}: {decision}")
+                return decision
+        
+        # Default fallback
+        print(f"    No rules applied to {current_rank}, defaulting to '维持'")
+        return '维持'
+
+def create_default_promotion_engine(promotion_df: pd.DataFrame = None, 
+                                  demotion_df: pd.DataFrame = None) -> PromotionRuleEngine:
+    """
+    Create a promotion engine with default rules.
+    
+    Args:
+        promotion_df: Optional promotion rules from Excel
+        demotion_df: Optional demotion rules from Excel
+        
+    Returns:
+        Configured PromotionRuleEngine
+    """
+    engine = PromotionRuleEngine()
+    
+    # Add Excel-based rules first (highest priority)
+    if promotion_df is not None and not promotion_df.empty:
+        excel_rule = ExcelBasedRule("Excel Rules", promotion_df, demotion_df or pd.DataFrame(), priority=3)
+        engine.add_rule(excel_rule)
+    
+    # Add composite rules for senior ranks
+    senior_ranks = ['BM1', 'BM2', 'BM3', 'AD0', 'AD1', 'AD2']
+    composite_rule = CompositeRule(
+        "Senior Rank Composite", 
+        rank_filter=senior_ranks,
+        fyc_threshold=300000,
+        renewal_rate_threshold=0.90,
+        new_policies_threshold=15,
+        priority=2
+    )
+    engine.add_rule(composite_rule)
+    
+    # Add basic FYC rule for junior ranks
+    junior_ranks = ['AS', 'BM0']
+    basic_rule = FYCBasedRule(
+        "Junior Rank Basic",
+        rank_filter=junior_ranks,
+        promotion_threshold=150000,
+        maintain_threshold=80000,
+        priority=1
+    )
+    engine.add_rule(basic_rule)
+    
+    # Add default fallback rule
+    fallback_rule = FYCBasedRule(
+        "Default Fallback",
+        rank_filter=[],  # Applies to all ranks
+        promotion_threshold=DEFAULT_PROMOTION_THRESHOLD,
+        maintain_threshold=DEFAULT_MAINTAIN_THRESHOLD,
+        priority=0
+    )
+    engine.add_rule(fallback_rule)
+    
+    return engine
+
+# =============================================================================
+# CUSTOM PROMOTION RULE CONFIGURATIONS
+# =============================================================================
+
+# Example: MDRT-based promotion rule
+class MDRTBasedRule(PromotionRule):
+    """Promotion rule based on MDRT achievement."""
+    
+    def __init__(self, name: str, rank_filter: List[str] = None, priority: int = 2):
+        super().__init__(name, priority)
+        self.rank_filter = rank_filter or []
+    
+    def applies_to(self, current_rank: str, performance_data: Dict) -> bool:
+        """Rule applies if MDRT data is available and rank matches filter."""
+        return (not self.rank_filter or current_rank in self.rank_filter) and \
+               '是否MDRT' in performance_data
+    
+    def evaluate(self, current_rank: str, performance_data: Dict) -> str:
+        """Promote if MDRT achieved, otherwise maintain."""
+        is_mdrt = performance_data.get('是否MDRT', False)
+        if is_mdrt:
+            return '晋升'
+        else:
+            # Check minimum performance to avoid demotion
+            fyc = performance_data.get('承保FYC', 0) or 0
+            if fyc >= 100000:  # Minimum threshold
+                return '维持'
+            else:
+                return '降级'
+
+# Example: Tenure-based rule (requires additional data)
+class TenureBasedRule(PromotionRule):
+    """Promotion rule that considers tenure in current rank."""
+    
+    def __init__(self, name: str, min_tenure_months: int = 12, 
+                 rank_filter: List[str] = None, priority: int = 1):
+        super().__init__(name, priority)
+        self.min_tenure_months = min_tenure_months
+        self.rank_filter = rank_filter or []
+    
+    def applies_to(self, current_rank: str, performance_data: Dict) -> bool:
+        """Rule applies if tenure data is available."""
+        return (not self.rank_filter or current_rank in self.rank_filter) and \
+               'months_in_rank' in performance_data
+    
+    def evaluate(self, current_rank: str, performance_data: Dict) -> str:
+        """Consider tenure along with performance."""
+        months_in_rank = performance_data.get('months_in_rank', 0)
+        fyc = performance_data.get('承保FYC', 0) or 0
+        
+        if months_in_rank >= self.min_tenure_months and fyc >= 200000:
+            return '晋升'
+        elif fyc >= 120000:
+            return '维持'
+        else:
+            return '降级'
+
+# Grade-specific promotion rule based on the Excel requirements
+class GradeSpecificRule(PromotionRule):
+    """Promotion rule based on specific grade requirements from Excel."""
+    
+    def __init__(self, name: str, priority: int = 4):
+        super().__init__(name, priority)
+        # Define specific requirements for each grade transition
+        self.promotion_requirements = {
+            'CA': {  # CA → AS
+                'target_rank': 'AS',
+                'time_requirement': 3,  # months
+                'individual_fyc': 9000,
+                'direct_fyc': 0,
+                'group_fyc': 0,
+                'renewal_rate': 0.85,
+                'team_size': 0
+            },
+            'AS': {  # AS → BM0 or BM1 (depending on performance)
+                'target_rank': 'BM0',  # Default target
+                'alternative_target': 'BM1',  # Higher performance target
+                'time_requirement': 6,
+                'individual_fyc': 18000,
+                'direct_fyc': 36000,  # For BM0
+                'direct_fyc_alt': 90000,  # For BM1
+                'group_fyc': 0,
+                'renewal_rate': 0.85,
+                'team_size': 4,  # For BM0
+                'team_size_alt': 6  # For BM1
+            },
+            'BM0': {  # BM0 → BM1
+                'target_rank': 'BM1',
+                'time_requirement': 6,
+                'individual_fyc': 12000,
+                'direct_fyc': 63000,
+                'group_fyc': 0,
+                'renewal_rate': 0.85,
+                'team_size': 4
+            },
+            'BM1': {  # BM1 → BM2
+                'target_rank': 'BM2',
+                'time_requirement': 12,
+                'individual_fyc': 12000,
+                'direct_fyc': 105000,
+                'group_fyc': 0,
+                'renewal_rate': 0.85,
+                'team_size': 8
+            },
+            'BM2': {  # BM2 → BM3 or AD0
+                'target_rank': 'BM3',
+                'alternative_target': 'AD0',
+                'time_requirement': 12,
+                'individual_fyc': 12000,
+                'direct_fyc': 175000,  # For BM3
+                'direct_fyc_alt': 112500,  # For AD0
+                'group_fyc': 0,
+                'group_fyc_alt': 300000,  # For AD0
+                'renewal_rate': 0.85,
+                'team_size': 14,  # For BM3
+                'team_size_alt': 21  # For AD0
+            },
+            'BM3': {  # BM3 → AD0
+                'target_rank': 'AD0',
+                'time_requirement': 12,
+                'individual_fyc': 12000,
+                'direct_fyc': 112500,
+                'group_fyc': 300000,
+                'renewal_rate': 0.85,
+                'team_size': 21
+            },
+            'AD0': {  # AD0 → AD1
+                'target_rank': 'AD1',
+                'time_requirement': 12,
+                'individual_fyc': 12000,
+                'direct_fyc': 135000,
+                'group_fyc': 450000,
+                'renewal_rate': 0.85,
+                'team_size': 38
+            },
+            'AD1': {  # AD1 → AD2
+                'target_rank': 'AD2',
+                'time_requirement': 12,
+                'individual_fyc': 0,  # Not specified
+                'direct_fyc': 0,      # Not specified
+                'group_fyc': 2000000,
+                'renewal_rate': 0.0,  # Not specified
+                'team_size': 80
+            }
+        }
+        
+        # Define maintenance/demotion thresholds (lower than promotion)
+        self.maintenance_requirements = {
+            'AS': {'individual_fyc': 9000, 'direct_fyc': 15000, 'renewal_rate': 0.85, 'team_size': 3},
+            'BM0': {'individual_fyc': 12000, 'direct_fyc': 25200, 'renewal_rate': 0.85, 'team_size': 2},
+            'BM1': {'individual_fyc': 12000, 'direct_fyc': 63000, 'renewal_rate': 0.85, 'team_size': 4},
+            'BM2': {'individual_fyc': 12000, 'direct_fyc': 105000, 'renewal_rate': 0.85, 'team_size': 8},
+            'BM3': {'individual_fyc': 12000, 'direct_fyc': 175000, 'renewal_rate': 0.85, 'team_size': 14},
+            'AD0': {'individual_fyc': 12000, 'direct_fyc': 112500, 'group_fyc': 300000, 'renewal_rate': 0.85, 'team_size': 21},
+            'AD1': {'individual_fyc': 12000, 'direct_fyc': 135000, 'group_fyc': 450000, 'renewal_rate': 0.85, 'team_size': 38},
+            'AD2': {'group_fyc': 2000000, 'team_size': 80}
+        }
+    
+    def applies_to(self, current_rank: str, performance_data: Dict) -> bool:
+        """Rule applies to all ranks that have defined requirements."""
+        return current_rank in self.promotion_requirements or current_rank in self.maintenance_requirements
+    
+    def evaluate(self, current_rank: str, performance_data: Dict) -> str:
+        """Evaluate based on grade-specific requirements."""
+        # Check promotion first
+        if current_rank in self.promotion_requirements:
+            req = self.promotion_requirements[current_rank]
+            
+            # Get performance metrics
+            individual_fyc = performance_data.get('承保FYC', 0) or 0
+            direct_fyc = performance_data.get('直辖FYC', 0) or performance_data.get('个险折算后FYC', 0) or 0
+            group_fyc = performance_data.get('所辖FYC', 0) or 0
+            renewal_rate = performance_data.get('续保率', 0) or 0
+            team_size = performance_data.get('直辖人力', 0) or performance_data.get('所辖人力', 0) or 0
+            
+            # Check if promotion criteria are met
+            promotion_met = True
+            
+            if req['individual_fyc'] > 0 and individual_fyc < req['individual_fyc']:
+                promotion_met = False
+            
+            if req['direct_fyc'] > 0 and direct_fyc < req['direct_fyc']:
+                promotion_met = False
+            
+            if req['group_fyc'] > 0 and group_fyc < req['group_fyc']:
+                promotion_met = False
+                
+            if req['renewal_rate'] > 0 and renewal_rate < req['renewal_rate']:
+                promotion_met = False
+                
+            if req['team_size'] > 0 and team_size < req['team_size']:
+                promotion_met = False
+            
+            # Check for alternative promotion path (AS → BM1, BM2 → AD0)
+            if not promotion_met and 'alternative_target' in req:
+                alt_promotion_met = True
+                
+                if req.get('direct_fyc_alt', 0) > 0 and direct_fyc < req['direct_fyc_alt']:
+                    alt_promotion_met = False
+                    
+                if req.get('group_fyc_alt', 0) > 0 and group_fyc < req['group_fyc_alt']:
+                    alt_promotion_met = False
+                    
+                if req.get('team_size_alt', 0) > 0 and team_size < req['team_size_alt']:
+                    alt_promotion_met = False
+                
+                if alt_promotion_met:
+                    return '晋升'  # Alternative promotion path
+            
+            if promotion_met:
+                return '晋升'
+        
+        # Check maintenance requirements
+        if current_rank in self.maintenance_requirements:
+            maint_req = self.maintenance_requirements[current_rank]
+            
+            # Get performance metrics
+            individual_fyc = performance_data.get('承保FYC', 0) or 0
+            direct_fyc = performance_data.get('直辖FYC', 0) or performance_data.get('个险折算后FYC', 0) or 0
+            group_fyc = performance_data.get('所辖FYC', 0) or 0
+            renewal_rate = performance_data.get('续保率', 0) or 0
+            team_size = performance_data.get('直辖人力', 0) or performance_data.get('所辖人力', 0) or 0
+            
+            # Check if maintenance criteria are met
+            maintenance_met = True
+            
+            if maint_req.get('individual_fyc', 0) > 0 and individual_fyc < maint_req['individual_fyc']:
+                maintenance_met = False
+            
+            if maint_req.get('direct_fyc', 0) > 0 and direct_fyc < maint_req['direct_fyc']:
+                maintenance_met = False
+            
+            if maint_req.get('group_fyc', 0) > 0 and group_fyc < maint_req['group_fyc']:
+                maintenance_met = False
+                
+            if maint_req.get('renewal_rate', 0) > 0 and renewal_rate < maint_req['renewal_rate']:
+                maintenance_met = False
+                
+            if maint_req.get('team_size', 0) > 0 and team_size < maint_req['team_size']:
+                maintenance_met = False
+            
+            if maintenance_met:
+                return '维持'
+            else:
+                return '降级'
+        
+        # Default fallback
+        return '维持'
+
+# Custom rule factory function
+def create_custom_promotion_engine(promotion_df: pd.DataFrame = None, 
+                                 demotion_df: pd.DataFrame = None,
+                                 enable_mdrt_rule: bool = True,
+                                 enable_composite_rule: bool = True) -> PromotionRuleEngine:
+    """
+    Create a custom promotion engine with additional business rules.
+    
+    Args:
+        promotion_df: Optional promotion rules from Excel
+        demotion_df: Optional demotion rules from Excel
+        enable_mdrt_rule: Whether to enable MDRT-based promotion rule
+        enable_composite_rule: Whether to enable composite performance rule
+        
+    Returns:
+        Configured PromotionRuleEngine with custom rules
+    """
+    engine = PromotionRuleEngine()
+    
+    # Add grade-specific rules first (highest priority) - based on Excel images
+    grade_specific_rule = GradeSpecificRule("Grade Specific Requirements", priority=5)
+    engine.add_rule(grade_specific_rule)
+    print("  Added grade-specific promotion rules from Excel requirements")
+    
+    # Add Excel-based rules (second highest priority)
+    if promotion_df is not None and not promotion_df.empty:
+        excel_rule = ExcelBasedRule("Excel Rules", promotion_df, demotion_df or pd.DataFrame(), priority=4)
+        engine.add_rule(excel_rule)
+        print("  Added Excel-based promotion rules")
+    
+    # Add MDRT-based rule for senior positions
+    if enable_mdrt_rule:
+        mdrt_rule = MDRTBasedRule(
+            "MDRT Achievement Rule",
+            rank_filter=['BM2', 'BM3', 'AD0', 'AD1'],
+            priority=3
+        )
+        engine.add_rule(mdrt_rule)
+        print("  Added MDRT-based promotion rule")
+    
+    # Add composite rules for different rank groups
+    if enable_composite_rule:
+        # Senior management rules (stricter criteria)
+        senior_rule = CompositeRule(
+            "Senior Management Composite",
+            rank_filter=['AD0', 'AD1', 'AD2'],
+            fyc_threshold=500000,
+            renewal_rate_threshold=0.92,
+            new_policies_threshold=20,
+            priority=2
+        )
+        engine.add_rule(senior_rule)
+        
+        # Middle management rules
+        middle_rule = CompositeRule(
+            "Middle Management Composite",
+            rank_filter=['BM1', 'BM2', 'BM3'],
+            fyc_threshold=300000,
+            renewal_rate_threshold=0.88,
+            new_policies_threshold=15,
+            priority=2
+        )
+        engine.add_rule(middle_rule)
+        
+        print("  Added composite performance rules")
+    
+    # Add basic FYC rule for entry-level positions
+    entry_rule = FYCBasedRule(
+        "Entry Level Basic",
+        rank_filter=['AS', 'BM0'],
+        promotion_threshold=150000,
+        maintain_threshold=80000,
+        priority=1
+    )
+    engine.add_rule(entry_rule)
+    
+    # Add default fallback rule
+    fallback_rule = FYCBasedRule(
+        "Default Fallback",
+        rank_filter=[],  # Applies to all ranks
+        promotion_threshold=DEFAULT_PROMOTION_THRESHOLD,
+        maintain_threshold=DEFAULT_MAINTAIN_THRESHOLD,
+        priority=0
+    )
+    engine.add_rule(fallback_rule)
+    
+    print(f"  Promotion engine configured with {len(engine.rules)} rules")
+    return engine
+
+# =============================================================================
 # RANK AND LAYER PROCESSING
 # =============================================================================
 
@@ -227,37 +802,6 @@ def apply_rank_remapping(df: pd.DataFrame) -> pd.DataFrame:
         df['上级主管职级'] = df['上级主管职级'].map(lambda x: RANK_MAP.get(x, x))
     
     return df
-
-def determine_promotion_decision(performance_data: Dict, promotion_rules: pd.DataFrame, 
-                               demotion_rules: pd.DataFrame) -> str:
-    """
-    Determine promotion/maintain/demotion decision based on performance and rules.
-    
-    Args:
-        performance_data: Dictionary containing performance metrics
-        promotion_rules: DataFrame with promotion rules
-        demotion_rules: DataFrame with demotion rules
-        
-    Returns:
-        Decision string: '晋升', '维持', or '降级'
-    """
-    # Use rule-based logic if rules are available
-    if not promotion_rules.empty:
-        # TODO: Implement complex rule parsing from promotion_rules DataFrame
-        # For now, fall back to simple logic
-        pass
-    
-    # Default logic based on 承保FYC累计
-    fyc_total = performance_data.get('承保FYC', 0)
-    if pd.isna(fyc_total):
-        fyc_total = 0
-        
-    if fyc_total >= DEFAULT_PROMOTION_THRESHOLD:
-        return '晋升'
-    elif fyc_total >= DEFAULT_MAINTAIN_THRESHOLD:
-        return '维持'
-    else:
-        return '降级'
 
 def apply_rank_adjustment(current_rank: str, decision: str) -> str:
     """
@@ -310,7 +854,11 @@ def calculate_performance_metrics(df: pd.DataFrame, agent_codes: List[str],
         '承保FYC': 'sum',
         '个险折算后FYC': 'sum',
         '续保率': 'mean',
-        '新单件数': 'sum'
+        '新单件数': 'sum',
+        '直辖FYC': 'sum',
+        '所辖FYC': 'sum',
+        '直辖人力': 'mean',  # Team size is averaged over assessment period
+        '所辖人力': 'mean'   # Team size is averaged over assessment period
     }
     
     # Calculate aggregations for available columns
@@ -334,7 +882,7 @@ def process_assessment_month(df: pd.DataFrame, current_month: int,
                            source_data: pd.DataFrame, promotion_rules: pd.DataFrame,
                            demotion_rules: pd.DataFrame) -> pd.DataFrame:
     """
-    Process assessment month with promotion/demotion logic.
+    Process assessment month with promotion/demotion logic using the modular rule engine.
     
     Args:
         df: Current month DataFrame
@@ -360,22 +908,46 @@ def process_assessment_month(df: pd.DataFrame, current_month: int,
     df = df.merge(perf_df, left_on='营销员代码', right_index=True, 
                   how='left', suffixes=('', '_累计'))
     
-    # Make promotion decisions
+    # Create promotion engine with rules (using custom engine for more flexibility)
+    print("  Initializing promotion rule engine...")
+    promotion_engine = create_custom_promotion_engine(
+        promotion_rules, 
+        demotion_rules,
+        enable_mdrt_rule=True,
+        enable_composite_rule=True
+    )
+    
+    # Make promotion decisions using the rule engine
     promotion_decisions = []
     new_ranks = []
     
     for idx, row in df.iterrows():
-        # Prepare performance data dictionary
-        perf_data = {col: row.get(f"{col}_累计", row.get(col, 0)) 
-                    for col in PERFORMANCE_COLUMNS if f"{col}_累计" in row or col in row}
+        agent_code = row['营销员代码']
+        current_rank = row['当前职级']
         
-        # Determine decision
-        decision = determine_promotion_decision(perf_data, promotion_rules, demotion_rules)
+        # Prepare performance data dictionary
+        perf_data = {}
+        for col in PERFORMANCE_COLUMNS:
+            # Try cumulative first, then current month
+            cumulative_col = f"{col}_累计"
+            if cumulative_col in row:
+                perf_data[col] = row[cumulative_col]
+            elif col in row:
+                perf_data[col] = row[col]
+            else:
+                perf_data[col] = 0
+        
+        # Use promotion engine to determine decision
+        print(f"  Evaluating {agent_code} ({current_rank})...")
+        decision = promotion_engine.evaluate(current_rank, perf_data)
         promotion_decisions.append(decision)
         
         # Apply rank adjustment
-        new_rank = apply_rank_adjustment(row['当前职级'], decision)
+        new_rank = apply_rank_adjustment(current_rank, decision)
         new_ranks.append(new_rank)
+        
+        if new_rank != current_rank:
+            print(f"    {agent_code}: {current_rank} → {new_rank} ({decision})")
     
     df['升降级标记'] = promotion_decisions
     df['当前职级'] = new_ranks
@@ -383,8 +955,12 @@ def process_assessment_month(df: pd.DataFrame, current_month: int,
     # Reapply rank remapping to update layers
     df = apply_rank_remapping(df)
     
-    print(f"  Processed {len(df)} agents: {promotion_decisions.count('晋升')} promotions, "
-          f"{promotion_decisions.count('降级')} demotions, {promotion_decisions.count('维持')} maintained")
+    # Summary statistics
+    promotion_count = promotion_decisions.count('晋升')
+    demotion_count = promotion_decisions.count('降级')
+    maintain_count = promotion_decisions.count('维持')
+    
+    print(f"  Assessment summary: {promotion_count} promotions, {demotion_count} demotions, {maintain_count} maintained")
     
     return df
 
@@ -611,7 +1187,7 @@ def process_monthly_data(source_data: pd.DataFrame, promotion_rules: pd.DataFram
     
     monthly_snapshots = []
     previous_agent_codes = set()
-    
+
     for month in month_list:
         print(f"\nProcessing month {month}...")
         
