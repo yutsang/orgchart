@@ -1108,6 +1108,12 @@ def process_assessment_month(df: pd.DataFrame, current_month: int,
         # Add assessment month flag for demotion logic
         perf_data['is_assessment_month'] = True  # This function is only called during assessment months
         
+        # Ensure all required metrics are available (use 0 as default for missing data)
+        required_metrics = ['业务主管人数', '引荐人数', '本人直增人数', '达星人数']
+        for metric in required_metrics:
+            if metric not in perf_data:
+                perf_data[metric] = 0
+        
         # Debug: Check if agent has any meaningful data
         has_data = any(perf_data.get(col, 0) > 0 for col in ['承保FYC', '直辖FYC', '个险折算后FYC', '所辖FYC'])
         if not has_data:
@@ -1176,7 +1182,17 @@ def process_assessment_month(df: pd.DataFrame, current_month: int,
 
 def validate_supervisor_hierarchy(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Recursively validate and fix supervisor hierarchy to ensure proper rank relationships.
+    Validate and fix supervisor hierarchy conflicts based on Excel columns.
+    
+    Column structure:
+    - Column B: 营销员代码 (Employee code)
+    - Column O: 直属主管代码 (Direct supervisor code, 8-digit)
+    - Column P: 直属主管职级 (Direct supervisor rank)
+    - Column Q: 上级主管代码 (Upper supervisor code, 8-digit)
+    - Column R: 上级主管职级 (Upper supervisor rank)
+    - Column S: AD代码 (AD code, 8-digit)
+    
+    Conflict detection: Check if subordinate rank >= supervisor rank (下屬職級比上級高或平級)
     
     Args:
         df: DataFrame with current organizational data
@@ -1186,106 +1202,206 @@ def validate_supervisor_hierarchy(df: pd.DataFrame) -> pd.DataFrame:
     """
     df = df.copy()
     
-    # Create lookup dictionaries
-    agent_rank_lookup = df.set_index('营销员代码')['当前职级'].to_dict()
-    supervisor_lookup = df.set_index('营销员代码')['上级主管代码'].to_dict()
-    
     def get_rank_hierarchy_level(rank: str) -> int:
         """Get numerical level for rank comparison (higher number = higher rank)."""
+        if pd.isna(rank) or rank == '':
+            return -1
         try:
             return RANK_HIERARCHY.index(rank)
         except ValueError:
             return -1  # Unknown rank
     
-    def find_valid_supervisor(agent_code: str, visited: Set[str] = None) -> str:
-        """Recursively find a valid supervisor who outranks the agent."""
+    def find_valid_supervisor_recursively(agent_code: str, visited: Set[str] = None) -> Tuple[str, str]:
+        """
+        Recursively find a valid supervisor who outranks the agent.
+        Returns (valid_supervisor_code, original_supervisor_to_store_as_mentor)
+        """
         if visited is None:
             visited = set()
             
         if agent_code in visited:
-            return ''  # Circular reference
+            return '', ''  # Circular reference
             
         visited.add(agent_code)
-        agent_rank = agent_rank_lookup.get(agent_code, '')
+        
+        # Get agent's current rank from 当前职级
+        agent_row = df[df['营销员代码'] == agent_code]
+        if agent_row.empty:
+            return '', ''
+            
+        agent_rank = agent_row.iloc[0].get('当前职级', '')
         agent_level = get_rank_hierarchy_level(agent_rank)
         
-        current_supervisor = supervisor_lookup.get(agent_code, '')
-        if not current_supervisor:
-            return ''
-            
-        supervisor_rank = agent_rank_lookup.get(current_supervisor, '')
+        # Get agent's current supervisor from Q column (上级主管代码)
+        current_supervisor_code = agent_row.iloc[0].get('上级主管代码', '')
+        if pd.isna(current_supervisor_code) or current_supervisor_code == '':
+            return '', ''
+        
+        # Get supervisor's rank from R column (上级主管职级) 
+        supervisor_rank = agent_row.iloc[0].get('上级主管职级', '')
         supervisor_level = get_rank_hierarchy_level(supervisor_rank)
         
-        # If supervisor outranks agent, this is valid
-        if supervisor_level > agent_level:
-            return current_supervisor
+        # Check for conflict: subordinate rank >= supervisor rank
+        if agent_level >= supervisor_level and supervisor_level >= 0:
+            # Conflict detected! Need to find supervisor's supervisor
+            print(f"    Conflict: {agent_code}({agent_rank}) >= {current_supervisor_code}({supervisor_rank})")
             
-        # If supervisor is same or lower rank, try to find their supervisor
-        return find_valid_supervisor(current_supervisor, visited)
+            # Try to find supervisor's supervisor recursively
+            next_supervisor, _ = find_valid_supervisor_recursively(current_supervisor_code, visited)
+            if next_supervisor:
+                return next_supervisor, current_supervisor_code
+            else:
+                # No valid supervisor found up the chain, keep original but flag as mentor
+                return '', current_supervisor_code
+        else:
+            # No conflict, current supervisor is valid
+            return current_supervisor_code, ''
     
     # Initialize 育成主管代码 if not exists
     if '育成主管代码' not in df.columns:
         df['育成主管代码'] = ''
     
-    # Process each agent to validate hierarchy
-    hierarchy_fixes = 0
+    # Process each agent to check for conflicts
+    conflicts_fixed = 0
+    changes_made = []
+    
     for idx, row in df.iterrows():
         agent_code = row['营销员代码']
         current_supervisor = row['上级主管代码']
         
         if pd.isna(current_supervisor) or current_supervisor == '':
             continue
-            
-        # Find valid supervisor
-        valid_supervisor = find_valid_supervisor(agent_code)
         
-        # If we found a different valid supervisor, update relationships
-        if valid_supervisor != current_supervisor and valid_supervisor:
-            df.at[idx, '育成主管代码'] = current_supervisor  # Store original as mentor
-            df.at[idx, '上级主管代码'] = valid_supervisor
-            hierarchy_fixes += 1
+        # Check for conflicts and resolve
+        valid_supervisor, mentor_supervisor = find_valid_supervisor_recursively(agent_code)
+        
+        if mentor_supervisor:  # Conflict was detected and resolved
+            if valid_supervisor:
+                df.at[idx, '上级主管代码'] = valid_supervisor
+                # Update R column (上级主管职级) to match new supervisor
+                new_supervisor_row = df[df['营销员代码'] == valid_supervisor]
+                if not new_supervisor_row.empty:
+                    new_supervisor_rank = new_supervisor_row.iloc[0]['当前职级']
+                    df.at[idx, '上级主管职级'] = new_supervisor_rank
+            
+            df.at[idx, '育成主管代码'] = mentor_supervisor
+            conflicts_fixed += 1
+            changes_made.append({
+                'agent': agent_code,
+                'old_supervisor': current_supervisor,
+                'new_supervisor': valid_supervisor,
+                'mentor': mentor_supervisor
+            })
     
-    if hierarchy_fixes > 0:
-        print(f"  Fixed {hierarchy_fixes} supervisor hierarchy conflicts")
+    # Bidirectional validation: Check if changes affected other relationships
+    if changes_made:
+        print(f"  Resolved {conflicts_fixed} supervisor rank conflicts")
+        # Re-validate affected supervisors
+        affected_supervisors = set()
+        for change in changes_made:
+            affected_supervisors.add(change['new_supervisor'])
+            affected_supervisors.add(change['mentor'])
+        
+        # Check if any affected supervisors now have conflicts with their own supervisors
+        for supervisor_code in affected_supervisors:
+            if pd.isna(supervisor_code) or supervisor_code == '':
+                continue
+            supervisor_row = df[df['营销员代码'] == supervisor_code]
+            if not supervisor_row.empty:
+                idx = supervisor_row.index[0]
+                valid_sup, mentor_sup = find_valid_supervisor_recursively(supervisor_code, set())
+                if mentor_sup:  # Additional conflict found
+                    if valid_sup:
+                        df.at[idx, '上级主管代码'] = valid_sup
+                        # Update rank
+                        new_sup_row = df[df['营销员代码'] == valid_sup]
+                        if not new_sup_row.empty:
+                            df.at[idx, '上级主管职级'] = new_sup_row.iloc[0]['当前职级']
+                    df.at[idx, '育成主管代码'] = mentor_sup
+                    print(f"    Cascaded fix: {supervisor_code} supervisor updated")
     
     return df
 
-def calculate_team_relationships(df: pd.DataFrame) -> pd.DataFrame:
+def calculate_dt_gt_relationships(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Calculate GT/DT relationship counts for each agent.
+    Calculate DT/GT relationships correctly based on manager rank.
+    
+    Logic based on your explanation:
+    - Column B: Employee number (营销员代码)
+    - Column Q: Upper supervisor code (上级主管代码) 
+    - If manager rank <= AS: DT relationship
+    - If manager rank > AS: GT relationship
     
     Args:
         df: DataFrame with organizational data
         
     Returns:
-        DataFrame with relationship counts added
+        DataFrame with correct DT/GT relationships and counts
     """
     df = df.copy()
     
-    # Initialize relationship count columns
-    df['GT_subordinates'] = 0
+    # Initialize relationship columns
+    df['主管关系'] = 'DT'  # Default to DT
     df['DT_subordinates'] = 0
+    df['GT_subordinates'] = 0
     df['total_subordinates'] = 0
     
-    # Count subordinates for each supervisor
-    for supervisor_code in df['营销员代码'].unique():
-        # Find all subordinates of this supervisor
-        subordinates = df[df['上级主管代码'] == supervisor_code]
+    # Create lookup for agent ranks
+    agent_rank_lookup = df.set_index('营销员代码')['当前职级'].to_dict()
+    
+    def get_rank_hierarchy_level(rank: str) -> int:
+        """Get numerical level for rank comparison (higher number = higher rank)."""
+        if pd.isna(rank) or rank == '':
+            return -1
+        try:
+            return RANK_HIERARCHY.index(rank)
+        except ValueError:
+            return -1
+    
+    # Step 1: Determine DT/GT relationship for each employee based on their supervisor's rank
+    for idx, row in df.iterrows():
+        agent_code = row['营销员代码']
+        supervisor_code = row.get('上级主管代码', '')
+        
+        if pd.isna(supervisor_code) or supervisor_code == '':
+            df.at[idx, '主管关系'] = 'DT'  # Default
+            continue
+        
+        # Get supervisor's rank
+        supervisor_rank = agent_rank_lookup.get(supervisor_code, '')
+        supervisor_level = get_rank_hierarchy_level(supervisor_rank)
+        as_level = get_rank_hierarchy_level('AS')
+        
+        # Determine relationship type based on supervisor's rank
+        if supervisor_level <= as_level and supervisor_level >= 0:
+            # Supervisor is AS or below → DT relationship
+            df.at[idx, '主管关系'] = 'DT'
+        elif supervisor_level > as_level:
+            # Supervisor is above AS → GT relationship  
+            df.at[idx, '主管关系'] = 'GT'
+        else:
+            # Unknown supervisor rank → default to DT
+            df.at[idx, '主管关系'] = 'DT'
+    
+    # Step 2: Count DT/GT subordinates for each manager
+    for manager_code in df['营销员代码'].unique():
+        # Find all employees who report to this manager (Q column = manager_code)
+        subordinates = df[df['上级主管代码'] == manager_code]
         
         if subordinates.empty:
             continue
-            
-        # Count GT and DT relationships
-        gt_count = (subordinates['主管关系'] == 'GT').sum()
+        
+        # Count DT and GT relationships
         dt_count = (subordinates['主管关系'] == 'DT').sum()
+        gt_count = (subordinates['主管关系'] == 'GT').sum()
         total_count = len(subordinates)
         
-        # Update supervisor's counts
-        supervisor_idx = df[df['营销员代码'] == supervisor_code].index
-        if not supervisor_idx.empty:
-            df.loc[supervisor_idx, 'GT_subordinates'] = gt_count
-            df.loc[supervisor_idx, 'DT_subordinates'] = dt_count
-            df.loc[supervisor_idx, 'total_subordinates'] = total_count
+        # Update manager's subordinate counts
+        manager_idx = df[df['营销员代码'] == manager_code].index
+        if not manager_idx.empty:
+            df.loc[manager_idx, 'DT_subordinates'] = dt_count
+            df.loc[manager_idx, 'GT_subordinates'] = gt_count
+            df.loc[manager_idx, 'total_subordinates'] = total_count
     
     return df
 
@@ -1304,11 +1420,8 @@ def update_supervisor_relationships(df: pd.DataFrame) -> pd.DataFrame:
     # Step 1: Validate supervisor hierarchy recursively
     df = validate_supervisor_hierarchy(df)
     
-    # Step 2: Apply relationship rules
-    df = apply_relationship_rules(df)
-    
-    # Step 3: Calculate team relationship counts
-    df = calculate_team_relationships(df)
+    # Step 2: Calculate DT/GT relationships based on supervisor ranks
+    df = calculate_dt_gt_relationships(df)
     
     return df
 
